@@ -1,0 +1,8 @@
+terraform {
+  backend "s3" {
+    bucket         = "chat-ops-tfstate-s3"
+    key            = "dev/ec2/terraform.tfstate"
+    region         = "us-east-1"
+    dynamodb_table = "chat-ops-tf-lock"
+  }
+}
