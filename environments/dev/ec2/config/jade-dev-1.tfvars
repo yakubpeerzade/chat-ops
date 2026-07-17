@@ -1,0 +1,6 @@
+instance_name  = "jade-dev-1"
+ami_id         = "ami-091138d0f0d41ff90"
+instance_type  = "t3.micro"
+project_code   = "jade"
+project_owner  = "Archan"
+request_id     = "HD-001"
