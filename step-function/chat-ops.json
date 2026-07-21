@@ -1,0 +1,272 @@
+{
+  "Comment": "Help-Desk Integrated ChatOps Workflow for account 676278186770 in us-east-1.",
+  "StartAt": "Main Router (Determine Action)",
+  "States": {
+    "Main Router (Determine Action)": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.requestContext.http.method",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.requestContext.http.method",
+              "StringEquals": "GET"
+            }
+          ],
+          "Next": "Task: Fetch Provisioned Resources"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.requestContext.http.method",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.requestContext.http.method",
+              "StringEquals": "DELETE"
+            }
+          ],
+          "Next": "Task: Delete Resource by ID"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.requestContext.http.method",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.requestContext.http.method",
+              "StringEquals": "POST"
+            }
+          ],
+          "Next": "Task: Parse Chat Input"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.httpMethod",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.httpMethod",
+              "StringEquals": "GET"
+            }
+          ],
+          "Next": "Task: Fetch Provisioned Resources"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.httpMethod",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.httpMethod",
+              "StringEquals": "DELETE"
+            }
+          ],
+          "Next": "Task: Delete Resource by ID"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.httpMethod",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.httpMethod",
+              "StringEquals": "POST"
+            }
+          ],
+          "Next": "Task: Parse Chat Input"
+        }
+      ],
+      "Default": "Unknown Action Error"
+    },
+    "Task: Fetch Provisioned Resources": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:dynamodb:query",
+      "Parameters": {
+        "TableName": "aws-ops-resources",
+        "KeyConditionExpression": "request_id = :id",
+        "ExpressionAttributeValues": {
+          ":id": {
+            "S.$": "$.queryStringParameters.request_id"
+          }
+        }
+      },
+      "Next": "End: Status Returned"
+    },
+    "End: Status Returned": {
+      "Type": "Succeed"
+    },
+    "Task: Delete Resource by ID": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:676278186770:function:ChatOps-Delete-Resource",
+      "ResultPath": "$.deleteExecutionResult",
+      "Next": "1. Fetch Active Item Metadata"
+    },
+    "1. Fetch Active Item Metadata": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:getItem",
+      "Parameters": {
+        "TableName": "aws-ops-resources",
+        "Key": {
+          "request_id": {
+            "S.$": "$.body.original_provision_ticket_id"
+          },
+          "resource_id": {
+            "S.$": "$.body.resource_id"
+          }
+        }
+      },
+      "ResultPath": "$.retrievedItem",
+      "Next": "2. Write to Archive Table"
+    },
+    "2. Write to Archive Table": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:putItem",
+      "Parameters": {
+        "TableName": "aws-ops-resources-archive",
+        "Item": {
+          "request_id": {
+            "S.$": "$.body.original_provision_ticket_id"
+          },
+          "resource_id": {
+            "S.$": "$.body.resource_id"
+          },
+          "project_env": {
+            "S.$": "$.retrievedItem.Item.project_env.S"
+          },
+          "resource_type": {
+            "S.$": "$.retrievedItem.Item.resource_type.S"
+          },
+          "requester_name": {
+            "S.$": "$.retrievedItem.Item.requester_name.S"
+          },
+          "approver_name": {
+            "S.$": "$.retrievedItem.Item.approver_name.S"
+          },
+          "status": {
+            "S": "DELETED"
+          },
+          "deletion_request_id": {
+            "S.$": "$.body.delete_ticket_id"
+          },
+          "deleted_by_approver": {
+            "S.$": "$.body.approver"
+          },
+          "deleted_at": {
+            "S.$": "$$.State.EnteredTime"
+          }
+        }
+      },
+      "ResultPath": null,
+      "Next": "3. Remove From Active Table"
+    },
+    "3. Remove From Active Table": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:deleteItem",
+      "Parameters": {
+        "TableName": "aws-ops-resources",
+        "Key": {
+          "request_id": {
+            "S.$": "$.body.original_provision_ticket_id"
+          },
+          "resource_id": {
+            "S.$": "$.body.resource_id"
+          }
+        }
+      },
+      "ResultPath": null,
+      "Next": "End: Deletion Complete"
+    },
+    "End: Deletion Complete": {
+      "Type": "Succeed"
+    },
+    "Task: Parse Chat Input": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:676278186770:function:ChatOps-Input-Parser",
+      "ResultPath": "$.parsedInput",
+      "Next": "Choice: Resource Type?"
+    },
+    "Choice: Resource Type?": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.parsedInput.resource_type",
+          "StringEquals": "ec2",
+          "Next": "Task: Lambda (EC2 specialized)"
+        },
+        {
+          "Variable": "$.parsedInput.resource_type",
+          "StringEquals": "s3",
+          "Next": "Task: Lambda (S3 specialized)"
+        }
+      ],
+      "Default": "Unsupported Resource Error"
+    },
+    "Task: Lambda (EC2 specialized)": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:676278186770:function:ChatOps-EC2-Processor",
+      "ResultPath": "$.provisioningResult",
+      "Next": "Log Resource to DynamoDB"
+    },
+    "Task: Lambda (S3 specialized)": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:676278186770:function:ChatOps-S3-Processor",
+      "ResultPath": "$.provisioningResult",
+      "Next": "Log Resource to DynamoDB"
+    },
+    "Log Resource to DynamoDB": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:putItem",
+      "Parameters": {
+        "TableName": "aws-ops-resources",
+        "Item": {
+          "request_id": {
+            "S.$": "$.parsedInput.request_id"
+          },
+          "resource_id": {
+            "S.$": "$.provisioningResult.name"
+          },
+          "project_env": {
+            "S.$": "States.Format('{}#{}', $.parsedInput.project, $.parsedInput.env)"
+          },
+          "resource_type": {
+            "S.$": "$.parsedInput.resource_type"
+          },
+          "status": {
+            "S": "PENDING_PROVISION"
+          },
+          "requester_name": {
+            "S.$": "$.parsedInput.requester_name"
+          },
+          "approver_name": {
+            "S.$": "$.parsedInput.approver_name"
+          },
+          "updated_at": {
+            "S.$": "$$.State.EnteredTime"
+          }
+        }
+      },
+      "Next": "End: Config Pushed to GitHub"
+    },
+    "End: Config Pushed to GitHub": {
+      "Type": "Succeed"
+    },
+    "Unknown Action Error": {
+      "Type": "Fail",
+      "Error": "UnknownAction",
+      "Cause": "The requested HTTP method is unsupported."
+    },
+    "Unsupported Resource Error": {
+      "Type": "Fail",
+      "Error": "UnsupportedResource",
+      "Cause": "The resource type requested is invalid."
+    }
+  }
+}
