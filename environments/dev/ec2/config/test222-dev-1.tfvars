@@ -1,0 +1,6 @@
+instance_name  = "test222-dev-1"
+ami_id         = "ami-091138d0f0d41ff90"
+instance_type  = "t2.micro"
+project_code   = "test222"
+project_owner  = "STACK Administrator"
+request_id     = "HD-B0206EC2"
