@@ -28,6 +28,12 @@ variable "security_group_ids" {
   default     = []
 }
 
+variable "key_name" {
+  type        = string
+  description = "SSH key pair name"
+  default     = null
+}
+
 variable "instance_name" {
   type        = string
   description = "Name tag for the EC2 instance"
