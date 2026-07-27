@@ -1,8 +1,17 @@
+data "aws_vpc" "default" {
+  default = true
+}
+
+data "aws_security_group" "default" {
+  vpc_id = data.aws_vpc.default.id
+  name   = "default"
+}
+
 resource "aws_instance" "this" {
   ami                    = nonsensitive(data.aws_ssm_parameter.ami.value)
   instance_type          = var.instance_type
   subnet_id              = var.subnet_id
-  vpc_security_group_ids = var.security_group_ids
+  vpc_security_group_ids = var.security_group_ids != null && length(var.security_group_ids) > 0 ? var.security_group_ids : [data.aws_security_group.default.id]
   key_name               = var.key_name
 
   metadata_options {
