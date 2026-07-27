@@ -1,0 +1,258 @@
+version: 0.2
+ 
+# Two modes:
+#   1. SINGLE-TARGET (preferred) — Step Functions calls startBuild with
+#      RESOURCE_ID / TF_ENV / RESOURCE_TYPE / ACTION overrides. One build,
+#      one resource, one state file. A failure blocks nothing else.
+#   2. BATCH — no overrides supplied; falls back to git-diff discovery.
+#      Kept for manual reruns and backfills only.
+ 
+env:
+  variables:
+    TF_VERSION: "1.6.6"
+    TF_IN_AUTOMATION: "true"
+    TF_INPUT: "false"
+    TF_CLI_ARGS: "-no-color"
+    STATE_BUCKET: "chat-ops-tfstate-s3"
+    LOCK_TABLE: "chat-ops-tf-lock"
+    AWS_REGION_TF: "us-east-1"
+    LOCK_TIMEOUT: "10m"
+    # Only these paths are ever treated as deployment targets.
+    TARGET_GLOB: "environments/*/*/config/*.tfvars"
+ 
+phases:
+  install:
+    commands:
+      - |
+        set -euo pipefail
+        echo "===== INSTALL ====="
+ 
+        # The original used apt-get unconditionally. That fails outright on the
+        # amazonlinux2/al2023 CodeBuild images ("apt-get: command not found"),
+        # and on any VPC-attached build without a NAT route to archive.ubuntu.com.
+        if ! command -v unzip >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
+          if command -v apt-get >/dev/null 2>&1; then
+            apt-get update -qq && apt-get install -y -qq unzip jq curl git
+          elif command -v yum >/dev/null 2>&1; then
+            yum install -y -q unzip jq curl git
+          else
+            echo "FATAL: no supported package manager found"; exit 1
+          fi
+        fi
+ 
+        # Pull from S3 first so builds don't depend on releases.hashicorp.com
+        # being reachable. Upload the zip there once as part of bootstrap.
+        TF_ZIP="terraform_${TF_VERSION}_linux_amd64.zip"
+        if ! aws s3 cp "s3://${STATE_BUCKET}/tooling/${TF_ZIP}" "/tmp/${TF_ZIP}" 2>/dev/null; then
+          echo "S3 copy unavailable, falling back to hashicorp.com"
+          curl -fsSL --retry 3 --retry-delay 2 \
+            -o "/tmp/${TF_ZIP}" \
+            "https://releases.hashicorp.com/terraform/${TF_VERSION}/${TF_ZIP}"
+        fi
+        unzip -q -o "/tmp/${TF_ZIP}" -d /usr/local/bin
+        chmod +x /usr/local/bin/terraform
+        terraform version
+ 
+  build:
+    commands:
+      # One block. The original spread `set -e`, TFVARS_FILES="" and the
+      # consuming loop across separate list items — AWS documents that each
+      # command may run in its own shell instance, so neither the `set -e` nor
+      # the variable is guaranteed to reach the loop.
+      - |
+        set -uo pipefail
+        echo "===== BUILD START ====="
+ 
+        ACTION="${ACTION:-apply}"
+        FAILED_TARGETS=""
+        OK_TARGETS=""
+        RESULTS_FILE="${CODEBUILD_SRC_DIR}/build-results.json"
+        echo '[]' > "$RESULTS_FILE"
+ 
+        # ---------------------------------------------------------------
+        # Target discovery
+        # ---------------------------------------------------------------
+        APPLY_TARGETS=""
+        DESTROY_TARGETS=""
+ 
+        if [ -n "${RESOURCE_ID:-}" ] && [ -n "${TF_ENV:-}" ] && [ -n "${RESOURCE_TYPE:-}" ]; then
+          echo "MODE: single-target (driven by startBuild overrides)"
+          BASE="environments/${TF_ENV}/${RESOURCE_TYPE}"
+          if [ "$ACTION" = "destroy" ]; then
+            DESTROY_TARGETS="${BASE}/config-archive/${RESOURCE_ID}.tfvars"
+          else
+            APPLY_TARGETS="${BASE}/config/${RESOURCE_ID}.tfvars"
+          fi
+ 
+        elif git rev-parse --git-dir >/dev/null 2>&1 && git rev-parse --verify -q HEAD~1 >/dev/null 2>&1; then
+          echo "MODE: batch, git delta"
+          # --diff-filter is the critical fix. The original used a bare
+          # `git diff --name-only`, which INCLUDES deleted paths. Every
+          # de-provisioning commit therefore fed the apply loop a file that no
+          # longer exists, and `cat`/`plan` killed the whole build.
+          #
+          # The pathspec MUST be quoted. Unquoted, the shell expands the glob
+          # against the working tree first, so a deleted path can never match
+          # and the destroy queue silently comes back empty.
+          APPLY_TARGETS=$(git diff --name-only --diff-filter=ACMR HEAD~1 HEAD -- "${TARGET_GLOB}" || true)
+          DESTROY_TARGETS=$(git diff --name-only --diff-filter=D HEAD~1 HEAD -- "${TARGET_GLOB}" || true)
+ 
+        else
+          echo "MODE: batch, full scan (shallow clone or zip source — no git delta available)"
+          # Restricted to the target glob. The original `find . -name "*.tfvars"`
+          # picked up environments/dev/config/*.tfvars, whose dirname(dirname())
+          # is environments/dev — a directory with no .tf files at all — and the
+          # build died there.
+          APPLY_TARGETS=$(find environments -mindepth 4 -maxdepth 4 \
+                            -path "*/config/*" -name "*.tfvars" \
+                            -not -path "*/.terraform/*" 2>/dev/null || true)
+        fi
+ 
+        if [ -z "$APPLY_TARGETS" ] && [ -z "$DESTROY_TARGETS" ]; then
+          echo "Nothing to do: no target manifests matched."
+          exit 0
+        fi
+ 
+        echo "--- apply queue ---";   echo "${APPLY_TARGETS:-<none>}"
+        echo "--- destroy queue ---"; echo "${DESTROY_TARGETS:-<none>}"
+ 
+        # ---------------------------------------------------------------
+        # Helpers
+        # ---------------------------------------------------------------
+        record() {
+          jq --arg t "$1" --arg a "$2" --arg s "$3" --arg m "$4" \
+             '. += [{target:$t, action:$a, status:$s, message:$m}]' \
+             "$RESULTS_FILE" > "${RESULTS_FILE}.tmp" && mv "${RESULTS_FILE}.tmp" "$RESULTS_FILE"
+        }
+ 
+        tf_init() {
+          # ENV_DIR is the terraform root; RES_ID names the state partition.
+          # This key MUST match the backend_key the provisioning lambda stored
+          # in DynamoDB, or destroy will init against an empty state, report
+          # "no changes", and silently orphan a running resource.
+          terraform init -input=false -reconfigure \
+            -backend-config="bucket=${STATE_BUCKET}" \
+            -backend-config="key=${1}" \
+            -backend-config="region=${AWS_REGION_TF}" \
+            -backend-config="dynamodb_table=${LOCK_TABLE}" \
+            -backend-config="encrypt=true"
+        }
+ 
+        run_target() {
+          local TFVARS_FILE="$1" MODE="$2"
+          local ROOT_DIR ENV_DIR RES_ID BASENAME STATE_KEY VARFILE RC=0
+ 
+          ROOT_DIR="$(pwd)"
+          TFVARS_FILE="${TFVARS_FILE#./}"
+          ENV_DIR="$(dirname "$(dirname "$TFVARS_FILE")")"
+          BASENAME="$(basename "$TFVARS_FILE")"
+          # basename -s is exact. `cut -d'.' -f1` truncated at the FIRST dot,
+          # so any manifest name containing a dot got the wrong state key.
+          RES_ID="$(basename "$TFVARS_FILE" .tfvars)"
+          STATE_KEY="${ENV_DIR}/${RES_ID}/terraform.tfstate"
+ 
+          echo "===================================================="
+          echo "  $MODE  ->  $RES_ID"
+          echo "  terraform root : $ENV_DIR"
+          echo "  state key      : $STATE_KEY"
+          echo "===================================================="
+ 
+          if [ ! -d "$ENV_DIR" ] || [ -z "$(ls "$ENV_DIR"/*.tf 2>/dev/null)" ]; then
+            echo "SKIP: $ENV_DIR contains no Terraform configuration."
+            record "$TFVARS_FILE" "$MODE" "SKIPPED" "no .tf files in $ENV_DIR"
+            return 0
+          fi
+ 
+          if [ "$MODE" = "destroy" ]; then
+            VARFILE="/tmp/${RES_ID}.destroy.tfvars"
+            if [ -f "$TFVARS_FILE" ]; then
+              cp "$TFVARS_FILE" "$VARFILE"
+            elif git rev-parse --git-dir >/dev/null 2>&1 && \
+                 git show "HEAD~1:${TFVARS_FILE}" > "$VARFILE" 2>/dev/null; then
+              # Recover the manifest from the parent commit. Terraform needs the
+              # variable values to destroy, and the delete commit removed them.
+              echo "Recovered manifest from HEAD~1."
+            else
+              echo "FAIL: cannot recover a var-file for $RES_ID."
+              record "$TFVARS_FILE" "$MODE" "FAILED" "var-file unrecoverable"
+              return 1
+            fi
+          else
+            if [ ! -f "$TFVARS_FILE" ]; then
+              echo "FAIL: $TFVARS_FILE does not exist."
+              record "$TFVARS_FILE" "$MODE" "FAILED" "manifest missing"
+              return 1
+            fi
+            VARFILE="${ROOT_DIR}/${TFVARS_FILE}"
+          fi
+ 
+          cd "$ENV_DIR" || return 1
+ 
+          # -lock-timeout matters: with the original full-repo scan, two
+          # concurrent builds raced for the same state locks and one died with
+          # "Error acquiring the state lock" instead of waiting.
+          if ! tf_init "$STATE_KEY"; then
+            cd "$ROOT_DIR"; record "$TFVARS_FILE" "$MODE" "FAILED" "init failed"; return 1
+          fi
+ 
+          terraform validate || { cd "$ROOT_DIR"; record "$TFVARS_FILE" "$MODE" "FAILED" "validate failed"; return 1; }
+ 
+          if [ "$MODE" = "destroy" ]; then
+            terraform destroy -input=false -auto-approve \
+              -lock-timeout="${LOCK_TIMEOUT}" -var-file="$VARFILE" || RC=$?
+          else
+            terraform plan -input=false -lock-timeout="${LOCK_TIMEOUT}" \
+              -var-file="$VARFILE" -out=tfplan || RC=$?
+            if [ $RC -eq 0 ]; then
+              terraform apply -input=false -auto-approve \
+                -lock-timeout="${LOCK_TIMEOUT}" tfplan || RC=$?
+            fi
+            # Never leave a plan file behind: it holds resolved variable values
+            # in plaintext and the original artifacts block shipped it.
+            rm -f tfplan
+          fi
+ 
+          if [ $RC -eq 0 ]; then
+            terraform state list || true
+            terraform output -json > "${ROOT_DIR}/output-${RES_ID}.json" 2>/dev/null || echo '{}' > "${ROOT_DIR}/output-${RES_ID}.json"
+            record "$TFVARS_FILE" "$MODE" "SUCCESS" "$STATE_KEY"
+          else
+            record "$TFVARS_FILE" "$MODE" "FAILED" "terraform exit $RC"
+          fi
+ 
+          cd "$ROOT_DIR"
+          return $RC
+        }
+ 
+        # ---------------------------------------------------------------
+        # Execute. Failures are collected, not fatal — the original aborted the
+        # whole loop on the first bad target, so every queued request behind it
+        # was silently never applied.
+        # ---------------------------------------------------------------
+        for T in $DESTROY_TARGETS; do
+          if run_target "$T" "destroy"; then OK_TARGETS="$OK_TARGETS $T"; else FAILED_TARGETS="$FAILED_TARGETS $T"; fi
+        done
+ 
+        for T in $APPLY_TARGETS; do
+          if run_target "$T" "apply"; then OK_TARGETS="$OK_TARGETS $T"; else FAILED_TARGETS="$FAILED_TARGETS $T"; fi
+        done
+ 
+        echo "===== BUILD SUMMARY ====="
+        jq . "$RESULTS_FILE"
+        echo "succeeded:${OK_TARGETS:- none}"
+        echo "failed:${FAILED_TARGETS:- none}"
+ 
+        if [ -n "$FAILED_TARGETS" ]; then
+          echo "One or more targets failed."
+          exit 1
+        fi
+        echo "===== BUILD COMPLETE ====="
+ 
+artifacts:
+  # The original shipped '**/*', which uploaded every .terraform/ directory
+  # (a full provider binary per environment, hundreds of MB), the .git dir, and
+  # the tfplan files — plan files contain resolved variable values in plaintext.
+  files:
+    - build-results.json
+    - output-*.json
+  discard-paths: yes
