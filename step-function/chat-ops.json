@@ -1,9 +1,10 @@
 {
-  "Comment": "Help-Desk Integrated ChatOps Workflow for account 676278186770 in us-east-1.",
-  "StartAt": "Main Router (Determine Action)",
+  "Comment": "ChatOps provisioning workflow, webhook-driven. Account 676278186770, us-east-1. Terraform runs are triggered by the GitHub webhook on Terraform-pipeline.",
+  "StartAt": "Route by Method",
   "States": {
-    "Main Router (Determine Action)": {
+    "Route by Method": {
       "Type": "Choice",
+      "Comment": "Choice with IsPresent is the ONLY safe way to read a field that may be absent.",
       "Choices": [
         {
           "And": [
@@ -13,10 +14,23 @@
             },
             {
               "Variable": "$.requestContext.http.method",
-              "StringEquals": "GET"
+              "StringEquals": "POST"
             }
           ],
-          "Next": "Task: Fetch Provisioned Resources"
+          "Next": "Task: Parse Chat Input"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.httpMethod",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.httpMethod",
+              "StringEquals": "POST"
+            }
+          ],
+          "Next": "Task: Parse Chat Input"
         },
         {
           "And": [
@@ -34,32 +48,6 @@
         {
           "And": [
             {
-              "Variable": "$.requestContext.http.method",
-              "IsPresent": true
-            },
-            {
-              "Variable": "$.requestContext.http.method",
-              "StringEquals": "POST"
-            }
-          ],
-          "Next": "Task: Parse Chat Input"
-        },
-        {
-          "And": [
-            {
-              "Variable": "$.httpMethod",
-              "IsPresent": true
-            },
-            {
-              "Variable": "$.httpMethod",
-              "StringEquals": "GET"
-            }
-          ],
-          "Next": "Task: Fetch Provisioned Resources"
-        },
-        {
-          "And": [
-            {
               "Variable": "$.httpMethod",
               "IsPresent": true
             },
@@ -73,15 +61,28 @@
         {
           "And": [
             {
+              "Variable": "$.requestContext.http.method",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.requestContext.http.method",
+              "StringEquals": "GET"
+            }
+          ],
+          "Next": "Task: Fetch Provisioned Resources"
+        },
+        {
+          "And": [
+            {
               "Variable": "$.httpMethod",
               "IsPresent": true
             },
             {
               "Variable": "$.httpMethod",
-              "StringEquals": "POST"
+              "StringEquals": "GET"
             }
           ],
-          "Next": "Task: Parse Chat Input"
+          "Next": "Validate Status Query"
         }
       ],
       "Default": "Unknown Action Error"
@@ -98,165 +99,313 @@
           }
         }
       },
-      "Next": "End: Status Returned"
+      "ResultPath": "$.queryResult",
+      "TimeoutSeconds": 15,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 3,
+          "BackoffRate": 2,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "Bad Request Error"
+        }
+      ],
+      "Next": "Validate Status Query"
+    },
+    "Validate Status Query": {
+      "Type": "Choice",
+      "Comment": "Guards the DynamoDB query.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.queryStringParameters",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.queryStringParameters.request_id",
+              "IsPresent": true
+            }
+          ],
+          "Next": "End: Status Returned"
+        }
+      ],
+      "Default": "Bad Request Error"
     },
     "End: Status Returned": {
       "Type": "Succeed"
     },
-    "Task: Delete Resource by ID": {
-      "Type": "Task",
-      "Resource": "arn:aws:lambda:us-east-1:676278186770:function:ChatOps-Delete-Resource",
-      "ResultPath": "$.deleteExecutionResult",
-      "Next": "1. Fetch Active Item Metadata"
-    },
-    "1. Fetch Active Item Metadata": {
-      "Type": "Task",
-      "Resource": "arn:aws:states:::dynamodb:getItem",
-      "Parameters": {
-        "TableName": "aws-ops-resources",
-        "Key": {
-          "request_id": {
-            "S.$": "$.body.original_provision_ticket_id"
-          },
-          "resource_id": {
-            "S.$": "$.body.resource_id"
-          }
-        }
-      },
-      "ResultPath": "$.retrievedItem",
-      "Next": "2. Write to Archive Table"
-    },
-    "2. Write to Archive Table": {
-      "Type": "Task",
-      "Resource": "arn:aws:states:::dynamodb:putItem",
-      "Parameters": {
-        "TableName": "aws-ops-resources-archive",
-        "Item": {
-          "request_id": {
-            "S.$": "$.body.original_provision_ticket_id"
-          },
-          "resource_id": {
-            "S.$": "$.body.resource_id"
-          },
-          "project_env": {
-            "S.$": "$.retrievedItem.Item.project_env.S"
-          },
-          "resource_type": {
-            "S.$": "$.retrievedItem.Item.resource_type.S"
-          },
-          "requester_name": {
-            "S.$": "$.retrievedItem.Item.requester_name.S"
-          },
-          "approver_name": {
-            "S.$": "$.retrievedItem.Item.approver_name.S"
-          },
-          "status": {
-            "S": "DELETED"
-          },
-          "deletion_request_id": {
-            "S.$": "$.body.delete_ticket_id"
-          },
-          "deleted_by_approver": {
-            "S.$": "$.body.approver"
-          },
-          "deleted_at": {
-            "S.$": "$$.State.EnteredTime"
-          }
-        }
-      },
-      "ResultPath": null,
-      "Next": "3. Remove From Active Table"
-    },
-    "3. Remove From Active Table": {
-      "Type": "Task",
-      "Resource": "arn:aws:states:::dynamodb:deleteItem",
-      "Parameters": {
-        "TableName": "aws-ops-resources",
-        "Key": {
-          "request_id": {
-            "S.$": "$.body.original_provision_ticket_id"
-          },
-          "resource_id": {
-            "S.$": "$.body.resource_id"
-          }
-        }
-      },
-      "ResultPath": null,
-      "Next": "End: Deletion Complete"
-    },
-    "End: Deletion Complete": {
-      "Type": "Succeed"
-    },
     "Task: Parse Chat Input": {
       "Type": "Task",
-      "Resource": "arn:aws:lambda:us-east-1:676278186770:function:ChatOps-Input-Parser",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "arn:aws:lambda:us-east-1:676278186770:function:ChatOps-Input-Parser",
+        "Payload.$": "$"
+      },
+      "ResultSelector": {
+        "parsed.$": "$.Payload"
+      },
       "ResultPath": "$.parsedInput",
+      "TimeoutSeconds": 30,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 4,
+          "BackoffRate": 2,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "ValidationError"
+          ],
+          "ResultPath": "$.error",
+          "Next": "Bad Request Error"
+        },
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "Notify Failure"
+        }
+      ],
       "Next": "Choice: Resource Type?"
     },
     "Choice: Resource Type?": {
       "Type": "Choice",
       "Choices": [
         {
-          "Variable": "$.parsedInput.resource_type",
+          "Variable": "$.parsedInput.parsed.resource_type",
           "StringEquals": "ec2",
-          "Next": "Task: Lambda (EC2 specialized)"
+          "Next": "Task: Provision EC2"
         },
         {
-          "Variable": "$.parsedInput.resource_type",
+          "Variable": "$.parsedInput.parsed.resource_type",
           "StringEquals": "s3",
-          "Next": "Task: Lambda (S3 specialized)"
+          "Next": "Task: Provision S3"
         }
       ],
       "Default": "Unsupported Resource Error"
     },
-    "Task: Lambda (EC2 specialized)": {
+    "Task: Provision EC2": {
       "Type": "Task",
-      "Resource": "arn:aws:lambda:us-east-1:676278186770:function:ChatOps-EC2-Processor",
-      "ResultPath": "$.provisioningResult",
-      "Next": "Log Resource to DynamoDB"
-    },
-    "Task: Lambda (S3 specialized)": {
-      "Type": "Task",
-      "Resource": "arn:aws:lambda:us-east-1:676278186770:function:ChatOps-S3-Processor",
-      "ResultPath": "$.provisioningResult",
-      "Next": "Log Resource to DynamoDB"
-    },
-    "Log Resource to DynamoDB": {
-      "Type": "Task",
-      "Resource": "arn:aws:states:::dynamodb:putItem",
+      "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
-        "TableName": "aws-ops-resources",
-        "Item": {
-          "request_id": {
-            "S.$": "$.parsedInput.request_id"
-          },
-          "resource_id": {
-            "S.$": "$.provisioningResult.name"
-          },
-          "project_env": {
-            "S.$": "States.Format('{}#{}', $.parsedInput.project, $.parsedInput.env)"
-          },
-          "resource_type": {
-            "S.$": "$.parsedInput.resource_type"
-          },
-          "status": {
-            "S": "PENDING_PROVISION"
-          },
-          "requester_name": {
-            "S.$": "$.parsedInput.requester_name"
-          },
-          "approver_name": {
-            "S.$": "$.parsedInput.approver_name"
-          },
-          "updated_at": {
-            "S.$": "$$.State.EnteredTime"
-          }
+        "FunctionName": "arn:aws:lambda:us-east-1:676278186770:function:ChatOps-EC2-Processor",
+        "Payload": {
+          "parsedInput.$": "$.parsedInput.parsed"
         }
       },
+      "ResultSelector": {
+        "result.$": "$.Payload"
+      },
+      "ResultPath": "$.provisioningResult",
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 4,
+          "BackoffRate": 2,
+          "JitterStrategy": "FULL"
+        },
+        {
+          "ErrorEquals": [
+            "GitHubConflict"
+          ],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 5,
+          "BackoffRate": 2,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "Notify Failure"
+        }
+      ],
       "Next": "End: Config Pushed to GitHub"
     },
-    "End: Config Pushed to GitHub": {
+    "Task: Provision S3": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "arn:aws:lambda:us-east-1:676278186770:function:ChatOps-S3-Processor",
+        "Payload": {
+          "parsedInput.$": "$.parsedInput.parsed"
+        }
+      },
+      "ResultSelector": {
+        "result.$": "$.Payload"
+      },
+      "ResultPath": "$.provisioningResult",
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 4,
+          "BackoffRate": 2,
+          "JitterStrategy": "FULL"
+        },
+        {
+          "ErrorEquals": [
+            "GitHubConflict"
+          ],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 5,
+          "BackoffRate": 2,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "Notify Failure"
+        }
+      ],
+      "Next": "End: Config Pushed to GitHub"
+    },
+    "Task: Delete Resource by ID": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "arn:aws:lambda:us-east-1:676278186770:function:ChatOps-Delete-Resource",
+        "Payload.$": "$"
+      },
+      "ResultSelector": {
+        "result.$": "$.Payload"
+      },
+      "ResultPath": "$.deleteExecutionResult",
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 4,
+          "BackoffRate": 2,
+          "JitterStrategy": "FULL"
+        },
+        {
+          "ErrorEquals": [
+            "GitHubConflict"
+          ],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 5,
+          "BackoffRate": 2,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "Notify Failure"
+        }
+      ],
+      "Next": "Was Resource Found?"
+    },
+    "Was Resource Found?": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.deleteExecutionResult.result.status",
+          "StringEquals": "DESTROY_QUEUED",
+          "Next": "End: Destroy Queued"
+        }
+      ],
+      "Default": "End: Nothing To Delete"
+    },
+    "End: Nothing To Delete": {
       "Type": "Succeed"
+    },
+    "Notify Failure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "arn:aws:lambda:us-east-1:676278186770:function:ChatOps-Notifier",
+        "Payload": {
+          "outcome": "FAILED",
+          "error.$": "$.error",
+          "execution.$": "$$.Execution.Name",
+          "input.$": "$"
+        }
+      },
+      "ResultPath": "$.notifyResult",
+      "TimeoutSeconds": 30,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "Provisioning Failed"
+        }
+      ],
+      "Next": "Provisioning Failed"
+    },
+    "Provisioning Failed": {
+      "Type": "Fail",
+      "Error": "ProvisioningFailed",
+      "Cause": "The request could not be completed. See the execution history and the FAILED record in DynamoDB."
+    },
+    "Bad Request Error": {
+      "Type": "Fail",
+      "Error": "BadRequest",
+      "Cause": "The request payload was missing required fields or could not be parsed."
     },
     "Unknown Action Error": {
       "Type": "Fail",
@@ -266,7 +415,13 @@
     "Unsupported Resource Error": {
       "Type": "Fail",
       "Error": "UnsupportedResource",
-      "Cause": "The resource type requested is invalid."
+      "Cause": "The resource type requested is invalid. Supported: ec2, s3."
+    },
+    "End: Config Pushed to GitHub": {
+      "Type": "Succeed"
+    },
+    "End: Destroy Queued": {
+      "Type": "Succeed"
     }
   }
 }
