@@ -1,13 +1,16 @@
 variable "bucket_name" {
-  type = string
+  type    = string
+  default = "dummy-bucket"
 }
 
 variable "project_code" {
-  type = string
+  type    = string
+  default = "jade"
 }
 
 variable "project_owner" {
-  type = string
+  type    = string
+  default = "unknown"
 }
 
 variable "request_id" {
