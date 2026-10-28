@@ -10,4 +10,5 @@ module "ec2" {
   instance_name      = var.instance_name
   project_code       = var.project_code
   project_owner      = var.project_owner
+  root_volume_size   = var.root_volume_size
 }
